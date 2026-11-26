@@ -38,6 +38,7 @@ import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Payments
+import androidx.compose.material.icons.filled.PointOfSale
 import androidx.compose.material.icons.filled.QrCode
 import androidx.compose.material.icons.filled.Sell
 import androidx.compose.material.icons.filled.Tune
@@ -47,6 +48,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -70,6 +72,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -84,6 +87,15 @@ import com.example.minhasfinancas.ui.components.DatePickerField
 import com.example.minhasfinancas.ui.theme.ExpenseRed
 import com.example.minhasfinancas.ui.theme.IncomeGreen
 import com.example.minhasfinancas.ui.util.Formatters
+
+private fun cleanMachineDescription(rawDesc: String): String {
+    return rawDesc
+        .replace(Regex("""\s*\(Taxa Maquininha:[^)]*\)"""), "")
+        .replace(Regex("""\s*\(Venda Débito[^)]*\)"""), "")
+        .replace(Regex("""\s*\(Venda Crédito[^)]*\)"""), "")
+        .replace(Regex("""\s*\(Venda na Maquininha[^)]*\)"""), "")
+        .trim()
+}
 
 private fun parsePaymentMethod(raw: String?): Pair<Set<String>, Map<String, String>> {
     if (raw.isNullOrBlank()) return emptySet<String>() to emptyMap<String, String>()
@@ -121,7 +133,7 @@ fun EditTransactionDialog(
 ) {
     val context = LocalContext.current
 
-    var description by remember { mutableStateOf(transaction.description) }
+    var description by remember { mutableStateOf(cleanMachineDescription(transaction.description)) }
     var amountText by remember {
         mutableStateOf(String.format(java.util.Locale.US, "%.2f", transaction.amount).replace(".", ","))
     }
@@ -132,6 +144,18 @@ fun EditTransactionDialog(
     var showMissingTagAlert by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var showDeleteConfirmDialog by remember { mutableStateOf(false) }
+
+    // Estados da Maquininha (para Entrada / Receita)
+    val isInitialMachine = transaction.isMachineTransaction && transaction.type == TransactionType.ENTRADA
+    var isMachine by remember { mutableStateOf(isInitialMachine) }
+    var machineGrossText by remember {
+        val g = if (transaction.isMachineTransaction) transaction.getEffectiveMachineGross() else 0.0
+        mutableStateOf(if (g > 0.0) String.format(java.util.Locale.US, "%.2f", g).replace(".", ",") else "")
+    }
+    var machineNetText by remember {
+        val n = if (transaction.isMachineTransaction) transaction.amount else 0.0
+        mutableStateOf(if (n > 0.0) String.format(java.util.Locale.US, "%.2f", n).replace(".", ",") else "")
+    }
 
     // Parse prévio das formas de pagamento e bancos da transação existente
     val (initialMethods, initialBanks) = remember(transaction) { parsePaymentMethod(transaction.paymentMethod) }
@@ -235,24 +259,65 @@ fun EditTransactionDialog(
                                         return@Button
                                     }
 
-                                    if (parsedAmount <= 0.0) {
-                                        errorMessage = "Informe um valor válido"
-                                        return@Button
-                                    }
-
                                     if (selectedTag.isNullOrBlank()) {
                                         showMissingTagAlert = true
                                         return@Button
                                     }
 
                                     val chosenTag = selectedTag!!
+                                    val isIncome = selectedType == TransactionType.ENTRADA
+
+                                    val finalAmount: Double
+                                    val finalDesc: String
+                                    val finalGross: Double?
+                                    val finalFee: Double?
+                                    val finalRate: Double?
+                                    val finalPaymentMethod: String?
+
+                                    if (isIncome && isMachine) {
+                                        val parsedGross = machineGrossText.replace(",", ".").toDoubleOrNull() ?: 0.0
+                                        val parsedNet = machineNetText.replace(",", ".").toDoubleOrNull() ?: 0.0
+
+                                        if (parsedGross <= 0.0) {
+                                            errorMessage = "Informe o valor cobrado na maquininha"
+                                            return@Button
+                                        }
+                                        if (parsedNet <= 0.0) {
+                                            errorMessage = "Informe o valor recebido em conta"
+                                            return@Button
+                                        }
+                                        if (parsedNet > parsedGross) {
+                                            errorMessage = "O valor recebido não pode ser maior que o valor cobrado"
+                                            return@Button
+                                        }
+
+                                        val feeAmount = (parsedGross - parsedNet).coerceAtLeast(0.0)
+                                        val feePercent = if (parsedGross > 0.0) (feeAmount / parsedGross) * 100.0 else 0.0
+
+                                        val detailNote = "Taxa Maquininha: ${String.format(java.util.Locale.US, "%.2f", feePercent)}% (${Formatters.formatCurrency(feeAmount)})"
+                                        finalDesc = if (rawDesc.isNotBlank()) "$rawDesc ($detailNote)" else "Venda na Maquininha ($detailNote)"
+                                        finalAmount = parsedNet
+                                        finalGross = parsedGross
+                                        finalFee = feeAmount
+                                        finalRate = feePercent
+                                    } else {
+                                        if (parsedAmount <= 0.0) {
+                                            errorMessage = "Informe um valor válido"
+                                            return@Button
+                                        }
+                                        finalAmount = parsedAmount
+                                        finalDesc = rawDesc
+                                        finalGross = null
+                                        finalFee = null
+                                        finalRate = null
+                                    }
 
                                     // Validação do meio de pagamento combinado caso mais de 1 seja selecionado
                                     if (selectedPaymentMethods.size > 1) {
                                         val splitSum = selectedPaymentMethods.sumOf { method ->
                                             splitAmounts[method]?.replace(",", ".")?.toDoubleOrNull() ?: 0.0
                                         }
-                                        if (kotlin.math.abs(parsedAmount - splitSum) > 0.01) {
+                                        if (kotlin.math.abs(finalAmount - splitSum) > 0.01) {
                                             errorMessage = "A soma entre as formas de pagamento está incorreta, verifique o valor total informado"
                                             return@Button
                                         }
@@ -267,13 +332,23 @@ fun EditTransactionDialog(
                                         formattedMethodsList.joinToString(" + ")
                                     } else null
 
+                                    finalPaymentMethod = if (isIncome && isMachine && chosenPaymentMethod.isNullOrBlank()) {
+                                        if (transaction.paymentMethod?.contains("Maquininha", ignoreCase = true) == true) transaction.paymentMethod
+                                        else "Maquininha de Cartão"
+                                    } else {
+                                        chosenPaymentMethod
+                                    }
+
                                     val updated = transaction.copy(
-                                        description = rawDesc,
-                                        amount = parsedAmount,
+                                        description = finalDesc,
+                                        amount = finalAmount,
                                         type = selectedType,
                                         date = selectedDateMillis,
                                         tag = chosenTag,
-                                        paymentMethod = chosenPaymentMethod
+                                        paymentMethod = finalPaymentMethod,
+                                        machineGrossAmount = finalGross,
+                                        machineFeeAmount = finalFee,
+                                        machineFeePercent = finalRate
                                     )
 
                                     onConfirmEdit(updated)
@@ -916,6 +991,167 @@ fun EditTransactionDialog(
                             }
                         }
                     }
+
+                // Recebimento na maquininha (Cartão) para Entrada
+                if (selectedType == TransactionType.ENTRADA) {
+                    Spacer(modifier = Modifier.height(14.dp))
+                    val installmentThemeColor = IncomeGreen
+                    val installmentTitle = "Recebimento na maquininha (Cartão)"
+
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(14.dp))
+                            .border(
+                                width = 1.dp,
+                                color = if (isMachine) installmentThemeColor.copy(alpha = 0.5f)
+                                else MaterialTheme.colorScheme.outline.copy(alpha = 0.2f),
+                                shape = RoundedCornerShape(14.dp)
+                            ),
+                        colors = CardDefaults.cardColors(
+                            containerColor = MaterialTheme.colorScheme.surface
+                        )
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(12.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        isMachine = !isMachine
+                                        if (isMachine && machineNetText.isBlank() && amountText.isNotBlank()) {
+                                            machineNetText = amountText
+                                        }
+                                    },
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Checkbox(
+                                    checked = isMachine,
+                                    onCheckedChange = { checked ->
+                                        isMachine = checked
+                                        if (checked && machineNetText.isBlank() && amountText.isNotBlank()) {
+                                            machineNetText = amountText
+                                        }
+                                    }
+                                )
+                                Icon(
+                                    imageVector = Icons.Default.PointOfSale,
+                                    contentDescription = null,
+                                    tint = if (isMachine) installmentThemeColor else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f),
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = installmentTitle,
+                                    style = MaterialTheme.typography.bodyMedium.copy(
+                                        fontWeight = if (isMachine) FontWeight.Bold else FontWeight.Normal
+                                    ),
+                                    color = if (isMachine) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                                )
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            // Conteúdo da Maquininha
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(start = 6.dp, end = 4.dp)
+                                    .graphicsLayer(alpha = if (isMachine) 1f else 0.38f)
+                            ) {
+                                Column(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                                ) {
+                                    OutlinedTextField(
+                                        value = machineGrossText,
+                                        onValueChange = {
+                                            machineGrossText = it.replace(",", ".")
+                                            errorMessage = null
+                                        },
+                                        label = { Text("Valor cobrado na maquininha (R$)") },
+                                        placeholder = { Text("0.00") },
+                                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                                        singleLine = true,
+                                        enabled = isMachine,
+                                        colors = OutlinedTextFieldDefaults.colors(
+                                            focusedContainerColor = MaterialTheme.colorScheme.surface,
+                                            unfocusedContainerColor = MaterialTheme.colorScheme.surface
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+
+                                    OutlinedTextField(
+                                        value = machineNetText,
+                                        onValueChange = {
+                                            machineNetText = it.replace(",", ".")
+                                            amountText = it.replace(",", ".")
+                                            errorMessage = null
+                                        },
+                                        label = { Text("Valor recebido em conta (R$)") },
+                                        placeholder = { Text("0.00") },
+                                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                                        singleLine = true,
+                                        enabled = isMachine,
+                                        colors = OutlinedTextFieldDefaults.colors(
+                                            focusedContainerColor = MaterialTheme.colorScheme.surface,
+                                            unfocusedContainerColor = MaterialTheme.colorScheme.surface
+                                        ),
+                                        shape = RoundedCornerShape(12.dp),
+                                        modifier = Modifier.fillMaxWidth()
+                                    )
+
+                                    val parsedGross = machineGrossText.replace(",", ".").toDoubleOrNull() ?: 0.0
+                                    val parsedNet = machineNetText.replace(",", ".").toDoubleOrNull() ?: 0.0
+                                    val machineFee = (parsedGross - parsedNet).coerceAtLeast(0.0)
+                                    val machineRate = if (parsedGross > 0.0) (machineFee / parsedGross) * 100.0 else 0.0
+
+                                    Card(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        shape = RoundedCornerShape(12.dp),
+                                        colors = CardDefaults.cardColors(
+                                            containerColor = if (isMachine) installmentThemeColor.copy(alpha = 0.12f)
+                                            else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+                                        )
+                                    ) {
+                                        Column(
+                                            modifier = Modifier
+                                                .fillMaxWidth()
+                                                .padding(horizontal = 14.dp, vertical = 10.dp)
+                                        ) {
+                                            Text(
+                                                text = "Taxa paga para a maquininha:",
+                                                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.SemiBold),
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                            Spacer(modifier = Modifier.height(4.dp))
+                                            Row(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                horizontalArrangement = Arrangement.SpaceBetween,
+                                                verticalAlignment = Alignment.CenterVertically
+                                            ) {
+                                                Text(
+                                                    text = "Porcentagem: ${String.format(java.util.Locale.US, "%.2f", machineRate)}%",
+                                                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                                    color = if (machineFee > 0.0) ExpenseRed else MaterialTheme.colorScheme.onSurface
+                                                )
+                                                Text(
+                                                    text = "Valor: ${Formatters.formatCurrency(machineFee)}",
+                                                    style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
+                                                    color = if (machineFee > 0.0) ExpenseRed else MaterialTheme.colorScheme.onSurface
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 if (errorMessage != null) {
                     Spacer(modifier = Modifier.height(10.dp))
